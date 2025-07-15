@@ -61,10 +61,12 @@ def customize_openapi():
             "bearerFormat": "JWT"
         }
     }
-    # Применяем BearerAuth ко всем методам
-    for path in openapi_schema["paths"].values():
-        for method in path.values():
-            method["security"] = [{"BearerAuth": []}]
+    # Применяем BearerAuth только к тем маршрутам, которые не относятся к CRM
+    for path, methods in openapi_schema["paths"].items():
+        needs_auth = not path.startswith("/api/crm")
+        if needs_auth:
+            for method in methods.values():
+                method["security"] = [{"BearerAuth": []}]
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 

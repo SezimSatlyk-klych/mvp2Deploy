@@ -1,10 +1,11 @@
 from fastapi import APIRouter, UploadFile, File, Query, Body, Form, HTTPException
-from typing import List
+from typing import List, Optional
 import pandas as pd
 import io
 import numpy as np
 from datetime import datetime
 from collections import defaultdict, Counter
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
@@ -360,40 +361,54 @@ def filter_users_by_language_excel_2025(
             result.append(row)
     return result
 
-@router.get("/filter_users_excel_2025", tags=["Excel"])
-def filter_users_excel_2025(
-    type: str = Query(None, regex="^(single|periodic|frequent)$", description="Тип донаций: single/periodic/frequent"),
-    date_from: str = Query(None, description="Начальная дата в формате DD.MM.YYYY"),
-    date_to: str = Query(None, description="Конечная дата в формате DD.MM.YYYY"),
-    amount_from: float = Query(None, description="Минимальная сумма (Сумма)"),
-    amount_to: float = Query(None, description="Максимальная сумма (Сумма)"),
-    gender: str = Query(None, description="Гендер: мужчина/женщина/неизвестно (опционально)"),
-    language: str = Query(None, description="Язык: казахский/русский/английский/другой (опционально)"),
-    source: str = Query(None, description="Фильтр по источнику (опционально)"),
-):
-    filtered = all_users_data
+# --------- Расширенная функция фильтрации -------------------------
+# Теперь параметры type / gender / language / source могут быть списками,
+# чтобы поддерживать выбор нескольких значений одного поля
+# (?type=single&type=frequent).
 
-    # 2. Фильтр по источнику
+def apply_filters(
+    data: list[dict],
+    type: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    amount_from: float | None = None,
+    amount_to: float | None = None,
+    gender: list[str] | None = None,
+    language: list[str] | None = None,
+    source: list[str] | None = None,
+) -> list[dict]:
+    filtered = data
+
+    # 2. Фильтр по источнику (можно несколько значений)
     if source:
-        filtered = [row for row in filtered if str(row.get("источник", "")).strip().lower() == source.strip().lower()]
+        source_set = {s.strip().lower() for s in source}
+        filtered = [row for row in filtered if str(row.get("источник", "")).strip().lower() in source_set]
 
-    # 3. Фильтр по типу донаций (single/periodic/frequent)
+    # 3. Фильтр по типу донаций (single/periodic/frequent) — список значений
     if type:
         from collections import defaultdict
+        accepted = {t.strip().lower() for t in type}
+        valid = {"single", "periodic", "frequent"}
+        if not accepted <= valid:
+            raise HTTPException(status_code=400, detail="Unsupported type value")
+
         counter = defaultdict(list)
         for row in filtered:
-            # Для группировки используем ФИО, если есть, иначе email
-            key = row.get("ФИО") or row.get("E-mail")
+            key = row.get("ФИО") or row.get("E-mail")  # группируем по ФИО/Email
             if key:
                 counter[key].append(row)
-        if type == "single":
-            filtered = [rows[0] for rows in counter.values() if len(rows) == 1]
-        elif type == "periodic":
-            filtered = [row for rows in counter.values() if 2 <= len(rows) <= 4 for row in rows]
-        elif type == "frequent":
-            filtered = [row for rows in counter.values() if len(rows) >= 5 for row in rows]
-        else:
-            filtered = []
+
+        temp = []
+        for rows in counter.values():
+            cnt = len(rows)
+            cls = (
+                "single"   if cnt == 1 else
+                "periodic" if 2 <= cnt <= 4 else
+                "frequent"
+            )
+            if cls in accepted:
+                temp.extend(rows)
+        filtered = temp
 
     # 4. Фильтр по периоду (дата)
     if date_from and date_to:
@@ -435,42 +450,44 @@ def filter_users_excel_2025(
                 temp.append(row)
         filtered = temp
 
-    # 6. Фильтр по полу
+    # 6. Фильтр по полу (может быть несколько значений)
     if gender:
-        gender_norm = gender.strip().lower()
-        gender_map = {
+        accepted_raw = gender
+        gender_map_single = {
             "мужчина": "мужчина",
             "женщина": "женщина",
             "неизвестно": "неизвестно",
             "муж": "мужчина",
             "жен": "женщина",
             "male": "мужчина",
-            "female": "женщина"
+            "female": "женщина",
         }
-        gender_norm = gender_map.get(gender_norm, gender_norm)
+        accepted = {gender_map_single.get(g.strip().lower(), g.strip().lower()) for g in accepted_raw}
         temp = []
         for row in filtered:
             g = row.get("gender")
             if not g:
                 fio = row.get("ФИО")
                 g = guess_gender_by_fio(fio)
-            if g and g.strip().lower() == gender_norm:
+            g_norm = g.strip().lower() if g else "неизвестно"
+            if g_norm in accepted:
                 temp.append(row)
         filtered = temp
 
-    # 7. Фильтр по языку
+    # 7. Фильтр по языку (список значений)
     if language:
-        lang_norm = language.strip().lower()
-        lang_map = {
+        lang_map_single = {
             "казахский": "казахский",
             "русский": "русский",
             "английский": "английский",
             "английский язык": "английский",
             "english": "английский",
             "другой": "другой",
-            "other": "другой"
+            "other": "другой",
         }
-        lang_norm = lang_map.get(lang_norm, lang_norm)
+        accepted_raw = language
+        accepted = {lang_map_single.get(l.strip().lower(), l.strip().lower()) for l in accepted_raw}
+
         temp = []
         for row in filtered:
             l = row.get("язык")
@@ -478,14 +495,75 @@ def filter_users_excel_2025(
                 fio = row.get("ФИО")
                 l = guess_language_by_fio(fio)
             l_norm = l.strip().lower() if l else "неизвестно"
-            if lang_norm == "другой":
+            if "другой" in accepted:
                 if l_norm not in ("казахский", "русский", "английский"):
                     temp.append(row)
-            elif l_norm == lang_norm:
+            if l_norm in accepted:
                 temp.append(row)
         filtered = temp
 
-    return filtered 
+    return filtered
+
+@router.get("/filter_users_excel_2025", tags=["Excel"])
+def filter_users_excel_2025(
+    type: list[str] | None = Query(None, description="Тип(ы) донаций: single/periodic/frequent"),
+    date_from: str | None = Query(None, description="Начальная дата DD.MM.YYYY"),
+    date_to: str | None = Query(None, description="Конечная дата DD.MM.YYYY"),
+    amount_from: float | None = Query(None, description="Минимальная сумма (Сумма)"),
+    amount_to: float | None = Query(None, description="Максимальная сумма (Сумма)"),
+    gender: list[str] | None = Query(None, description="Пол(ы): мужчина/женщина/неизвестно"),
+    language: list[str] | None = Query(None, description="Язык(и): казахский/русский/английский/другой"),
+    source: list[str] | None = Query(None, description="Источник(и)"),
+):
+    return apply_filters(
+        all_users_data,
+        type,
+        date_from,
+        date_to,
+        amount_from,
+        amount_to,
+        gender,
+        language,
+        source,
+    )
+
+@router.get("/export_users_excel_2025", tags=["Excel"])
+def export_users_excel_2025(
+    type: list[str] | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    amount_from: float | None = Query(None),
+    amount_to: float | None = Query(None),
+    gender: list[str] | None = Query(None),
+    language: list[str] | None = Query(None),
+    source: list[str] | None = Query(None),
+):
+    rows = apply_filters(
+        all_users_data,
+        type,
+        date_from,
+        date_to,
+        amount_from,
+        amount_to,
+        gender,
+        language,
+        source,
+    )
+
+    if not rows:
+        raise HTTPException(404, "Нет данных под выбранные фильтры")
+
+    df = pd.DataFrame(rows)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=filtered_users.xlsx"}
+    )
 
 @router.post("/add_user_excel_2025", tags=["Excel"])
 def add_user_excel_2025(user: dict = Body(...)):
@@ -500,7 +578,7 @@ def add_user_excel_2025(user: dict = Body(...)):
     if "язык" not in user:
         user["язык"] = None
     all_users_data.append(user)
-    return user 
+    return user
 
 @router.put("/update_user_excel_2025", tags=["Excel"])
 def update_user_excel_2025(
